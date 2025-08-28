@@ -1,9 +1,11 @@
 # :fire: DiT4SR: Taming Diffusion Transformer for Real-World Image Super-Resolution (ICCV2025)
 
-<a href='https://arxiv.org/abs/2503.23580'><img src='https://img.shields.io/badge/Paper-arxiv-b31b1b.svg'></a> &nbsp;&nbsp;
+<a href='https://arxiv.org/abs/2503.23580'><img src='https://img.shields.io/badge/Paper-Arxiv-b31b1b.svg'></a> &nbsp;&nbsp;
 <a href='https://adam-duan.github.io/projects/dit4sr/'><img src='https://img.shields.io/badge/Project page-DiT4SR-1bb41b.svg'></a> &nbsp;&nbsp;
 <a href='https://huggingface.co/datasets/acceptee/NKUSR8K'><img src='https://img.shields.io/badge/Dataset-NKUSR8K-ffff00.svg'></a> &nbsp;&nbsp;
-<a href='https://huggingface.co/spaces/acceptee/DiT4SR'><img src='https://img.shields.io/badge/Space-huggingface-ffd700.svg'></a> &nbsp;&nbsp;
+<a href='https://huggingface.co/spaces/acceptee/DiT4SR'><img src='https://img.shields.io/badge/Space-Huggingface-ffd700.svg'></a> &nbsp;&nbsp;
+<a href='assets/DiT4SR_CN.pdf'><img src='https://img.shields.io/badge/Paper-中文版-blue.svg'></a> &nbsp;&nbsp;
+<a href='assets/DiT4SR_supp.pdf'><img src='https://img.shields.io/badge/Paper-Supplematary-orange.svg'></a> &nbsp;&nbsp;
 
 
 
@@ -29,6 +31,7 @@ This is the official PyTorch codes for the paper:
 - [x] ~~Release Checkpoints~~
 - [x] ~~Release NKUSR8K dataset~~
 - [x] ~~Release training and inference code~~
+- [x] ~~Release Chinese version and supplemenatary material~~
 
 
 ## :wrench: Dependencies and Installation

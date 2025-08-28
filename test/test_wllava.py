@@ -306,7 +306,7 @@ if __name__ == "__main__":
     parser.add_argument("--vae_encoder_tiled_size", type=int, default=1024) # image size, for 13G
     parser.add_argument("--latent_tiled_size", type=int, default=64) 
     parser.add_argument("--latent_tiled_overlap", type=int, default=24) 
-    parser.add_argument("--upscale", type=int, default=4)
+    parser.add_argument("--upscale", type=int, default=1)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--sample_times", type=int, default=1)
     parser.add_argument("--align_method", type=str, choices=['wavelet', 'adain', 'nofix'], default='adain')
