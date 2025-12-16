@@ -14,6 +14,8 @@
 
 import inspect
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+import matplotlib.pyplot as plt
+import os 
 
 import torch
 from transformers import (
@@ -191,6 +193,8 @@ class StableDiffusion3ControlNetPipeline(DiffusionPipeline, SD3LoraLoaderMixin, 
         tokenizer_3: T5TokenizerFast,
         tokenizer_2: CLIPTokenizer,
         raft: Any = None,
+        debug_viz: bool = False,
+        debug_viz_steps: Optional[Union[str, List[int]]] = None,
     ):
         super().__init__()
 
@@ -218,7 +222,9 @@ class StableDiffusion3ControlNetPipeline(DiffusionPipeline, SD3LoraLoaderMixin, 
             else 128
         )
         self.raft = raft
-
+        self.debug_viz = debug_viz
+        self.debug_viz_steps = debug_viz_steps
+        
     def _init_tiled_vae(self,
             encoder_tile_size = 256,
             decoder_tile_size = 256,
@@ -749,6 +755,23 @@ class StableDiffusion3ControlNetPipeline(DiffusionPipeline, SD3LoraLoaderMixin, 
         weights = np.outer(y_probs, x_probs)
         return torch.tile(torch.tensor(weights, device=self.device), (nbatches, 16, 1, 1))
 
+    def _gaussian_weights_feature(self, tile_width, tile_height, nbatches):
+        """Generates a gaussian mask of weights for tile contributions"""
+        from numpy import pi, exp, sqrt
+        import numpy as np
+
+        latent_width = tile_width
+        latent_height = tile_height
+
+        var = 0.01
+        midpoint = (latent_width - 1) / 2  # -1 because index goes from 0 to latent_width - 1
+        x_probs = [exp(-(x-midpoint)*(x-midpoint)/(latent_width*latent_width)/(2*var)) / sqrt(2*pi*var) for x in range(latent_width)]
+        midpoint = latent_height / 2
+        y_probs = [exp(-(y-midpoint)*(y-midpoint)/(latent_height*latent_height)/(2*var)) / sqrt(2*pi*var) for y in range(latent_height)]
+
+        weights = np.outer(y_probs, x_probs)
+        return torch.tile(torch.tensor(weights, device=self.device), (nbatches, 1536, 1, 1)).permute(0,2,3,1)
+    
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
@@ -782,7 +805,8 @@ class StableDiffusion3ControlNetPipeline(DiffusionPipeline, SD3LoraLoaderMixin, 
         start_point = 'noise',
         latent_tiled_size=320,
         latent_tiled_overlap=4,
-        args=None,
+        noise=None,
+        args=None
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -953,7 +977,10 @@ class StableDiffusion3ControlNetPipeline(DiffusionPipeline, SD3LoraLoaderMixin, 
             num_images_per_prompt=num_images_per_prompt,
             max_sequence_length=max_sequence_length,
         )
-
+        
+        original_control_image = control_image
+        num_frames = original_control_image.shape[0]
+        
         control_image = self.prepare_image(
                 image=control_image,
                 width=width,
@@ -976,9 +1003,20 @@ class StableDiffusion3ControlNetPipeline(DiffusionPipeline, SD3LoraLoaderMixin, 
         # # pad_tensor = torch.zeros(control_image.shape[0], 77 - image_embedding.shape[1], 4096).to(image_embedding.device, dtype=dtype)
         # # image_embedding = torch.cat([image_embedding, pad_tensor], dim=1)
         # prompt_embeds = torch.cat([prompt_embeds, image_embedding], dim=-2)
+        
+        
+        
+        # 3. Encode control image
+        control_images = []
+        for _ in range(control_image.shape[0]):
+            _control_image = control_image[_:_+1]
+            _control_image = self.vae.encode(_control_image).latent_dist.sample()
+            _control_image = (_control_image - self.vae.config.shift_factor) * self.vae.config.scaling_factor
+            control_images.append(_control_image)
+        control_image = torch.cat(control_images, dim=0)
 
-        control_image = self.vae.encode(control_image).latent_dist.sample()
-        control_image = (control_image - self.vae.config.shift_factor) * self.vae.config.scaling_factor
+        # Padding for square latents
+        
 
         # 4. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
@@ -998,6 +1036,7 @@ class StableDiffusion3ControlNetPipeline(DiffusionPipeline, SD3LoraLoaderMixin, 
             generator,
             latents,
         )
+        
         # control_image = torch.cat([latents, control_image], dim=0)
         # 6. Prepare the start point
         if start_point == 'noise':
@@ -1011,171 +1050,450 @@ class StableDiffusion3ControlNetPipeline(DiffusionPipeline, SD3LoraLoaderMixin, 
             while len(sigma.shape) < 4:
                 sigma = sigma.unsqueeze(-1)
             latents = (1.0 - sigma) * latents_condition_image + sigma * latents
+            
+        # 7. Setting feature extractor
+        import re
+        target_modules = args.target_modules # Input of 'norm2' -> Pre-AdaLN, Input of 'ff' -> Post-AdaLN
+        pattern = rf"transformer_blocks\.(\d+)\.(?:{'|'.join(target_modules)})$"
+        target_indices = args.target_indices
+        target_features = []
+        
+        ## Hooks for feature extraction
+        def get_input_hook(name):
+            def hook(module, input, output):
+                # [B, 2048, 1536] -> [B, 1024, 1536] 
+                feature = input[0].chunk(2, dim=1)[0]
+                target_features.append(feature)
+            return hook
+            
+        def register_hooks(model, indices=None):
+            handles = []
+            for name, module in model.named_modules():
+                is_match = re.match(pattern, name)
+                if is_match:
+                    block_idx = int(name.split('.')[1])
+                    if block_idx in indices:
+                        handle = module.register_forward_hook(get_input_hook(name))
+                        handles.append(handle)
+                        
+            return handles
+        
+        handles = register_hooks(self.transformer, target_indices)    
 
+        def _maybe_parse_debug_steps(arg_str: str):
+            if not arg_str:
+                return None
+            out = []
+            for tok in arg_str.split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                try:
+                    out.append(int(tok))
+                except:
+                    pass
+            return set(out) if out else None
+
+        debug_viz = bool(getattr(args, "debug_viz", False)) if args is not None else False
+        debug_steps = _maybe_parse_debug_steps(getattr(args, "debug_viz_steps", "")) if debug_viz else None
+        debug_dir = getattr(args, "debug_viz_dir", "debug_step_viz") if debug_viz else None
+        if debug_viz:
+            os.makedirs(debug_dir, exist_ok=True)
+            
         # 8. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
 
             _, _, h, w = latents.size()
             tile_size, tile_overlap = (latent_tiled_size, latent_tiled_overlap) if args is not None else (256, 8)
+            
             if h*w<=tile_size*tile_size:
                 print(f"[Tiled Latent]: the input size is tiny and unnecessary to tile.")
             else:
                 print(f"[Tiled Latent]: the input size is {latents.shape[-2]}x{latents.shape[-1]}, need to tiled")
-
+            
+            if self.do_classifier_free_guidance:
+                uncond_control_image, cond_control_image = control_image.chunk(2, dim=0)
+                control_image = torch.stack([uncond_control_image, cond_control_image], dim=0) # [2, F, C, H, W]
+            
+            num_steps = len(timesteps)
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
-                # latent_model_input = torch.cat([latents, control_image], dim=1)
-                latent_model_input = latents
-
-                # expand the latents if we are doing classifier free guidance
-                latent_model_input = torch.cat([latent_model_input] * 2) if self.do_classifier_free_guidance else latent_model_input
-                # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
-                timestep = t.expand(latent_model_input.shape[0])
-
-                if h*w<=tile_size*tile_size: # tiled latent input
-                    # image_embedding = control_image.view(control_image.shape[0], 16, -1)
-                    # prompt_embeds_input = torch.cat([prompt_embeds, image_embedding], dim=-2)
-                    prompt_embeds_input = prompt_embeds
+                
+                # Setting for video
+                cached_noise_preds = [None for _ in range(num_frames)]
+                cached_target_features = [[None for _ in range(num_frames)] for _ in range(len(target_indices))]
+                
+                chunck_size = args.chunk_size
+                overlap_size = args.overlap_size
+                stride_size = chunck_size - overlap_size
+                
+                for start_f in range(0, num_frames, stride_size):
+                    end_f = min(start_f + chunck_size, num_frames)
+                    cur_stride = end_f - start_f
+                    # Handle for when the only lasst frame is remaining
+                    if cur_stride == 1:
+                        end_f = num_frames
+                        start_f = max(0, end_f - chunck_size)
+                        cur_stride = end_f - start_f
+                    
+                    cur_control_image = control_image[:, start_f:end_f].clone() # [2, cur_F, C, H, W] for CFG else [cur_F, C, H, W]
+                    latent_model_input = latents[start_f:end_f].clone() # [cur_F, C, H, W]
+                            
+                    cur_prompt_embeds_input = prompt_embeds.repeat(cur_stride, 1, 1)
+                    cur_pooled_prompt_embeds_input = pooled_prompt_embeds.repeat(cur_stride, 1)
+                
                     if negative_prompt_embeds is not None:
-                        # negative_prompt_embeds_input = torch.cat([negative_prompt_embeds, image_embedding], dim=-2)
-                        negative_prompt_embeds_input = negative_prompt_embeds
-
+                        negative_prompt_embeds_input = negative_prompt_embeds.repeat(cur_stride, 1, 1)
+                        negative_pooled_prompt_embeds_input = negative_pooled_prompt_embeds.repeat(cur_stride, 1)
+                        
                     if self.do_classifier_free_guidance:
-                        prompt_embeds_input = torch.cat([negative_prompt_embeds_input, prompt_embeds_input], dim=0)
-                        pooled_prompt_embeds_input = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
+                        cur_control_image = cur_control_image.reshape(-1, cur_control_image.shape[2], cur_control_image.shape[3], cur_control_image.shape[4]) # [2*cur_F, C, H, W]
+                        latent_model_input = torch.cat([latent_model_input] * 2, dim=0) # [2*cur_F, C, H, W]
+                        prompt_embeds_input = torch.cat([negative_prompt_embeds_input, cur_prompt_embeds_input], dim=0)
+                        pooled_prompt_embeds_input = torch.cat([negative_pooled_prompt_embeds_input, cur_pooled_prompt_embeds_input], dim=0)
                     else:
                         pooled_prompt_embeds_input = pooled_prompt_embeds
-                # controlnet(s) inference
-                    noise_pred = self.transformer(
-                        hidden_states=latent_model_input,
-                        controlnet_image=control_image,
-                        timestep=timestep,
-                        encoder_hidden_states=prompt_embeds_input,
-                        pooled_projections=pooled_prompt_embeds_input,
-                        joint_attention_kwargs=self.joint_attention_kwargs,
-                        return_dict=False,
-                    )[0]
-                else:
-                    tile_weights = self._gaussian_weights(tile_size, tile_size, 1)
-                    tile_size = min(tile_size, min(h, w))
-                    tile_weights = self._gaussian_weights(tile_size, tile_size, 1)
+                        
+                    timestep = t.expand(latent_model_input.shape[0])
+                    do_tiling = h*w > tile_size*tile_size
+                    
+                    if not do_tiling: # tiled latent input
+                        # controlnet(s) inference
+                        
+                        target_features.clear()
+                        
+                        noise_pred = self.transformer(
+                            hidden_states=latent_model_input,
+                            controlnet_image=cur_control_image,
+                            timestep=timestep,
+                            encoder_hidden_states=prompt_embeds_input,
+                            pooled_projections=pooled_prompt_embeds_input,
+                            joint_attention_kwargs=self.joint_attention_kwargs,
+                            return_dict=False,
+                        )[0]
+                        target_features = [i_target_feature.reshape(-1, h//2, w//2, i_target_feature.shape[-1]) for i_target_feature in target_features]
+                    else:
+                        tile_size = min(tile_size, min(h, w))
+                        tile_weights = self._gaussian_weights(tile_size, tile_size, 1)
+                        
+                        feature_tile_size = tile_size // 2
+                        feature_tile_overlap = tile_overlap // 2
+                        feature_tile_weights = self._gaussian_weights_feature(feature_tile_size, feature_tile_size, 1)
+                        
 
-                    grid_rows = 0
-                    cur_x = 0
-                    while cur_x < latent_model_input.size(-1):
-                        cur_x = max(grid_rows * tile_size-tile_overlap * grid_rows, 0)+tile_size
-                        grid_rows += 1
+                        grid_rows = 0
+                        cur_x = 0
+                        while cur_x < latent_model_input.size(-1):
+                            cur_x = max(grid_rows * tile_size-tile_overlap * grid_rows, 0)+tile_size
+                            grid_rows += 1
 
-                    grid_cols = 0
-                    cur_y = 0
-                    while cur_y < latent_model_input.size(-2):
-                        cur_y = max(grid_cols * tile_size-tile_overlap * grid_cols, 0)+tile_size
-                        grid_cols += 1
+                        grid_cols = 0
+                        cur_y = 0
+                        while cur_y < latent_model_input.size(-2):
+                            cur_y = max(grid_cols * tile_size-tile_overlap * grid_cols, 0)+tile_size
+                            grid_cols += 1
 
-                    input_list = []
-                    cond_list = []
-                    img_list = []
-                    noise_preds = []
-                    for row in range(grid_rows):
-                        noise_preds_row = []
-                        for col in range(grid_cols):
-                            if col < grid_cols-1 or row < grid_rows-1:
-                                # extract tile from input image
-                                ofs_x = max(row * tile_size-tile_overlap * row, 0)
-                                ofs_y = max(col * tile_size-tile_overlap * col, 0)
-                                # input tile area on total image
-                            if row == grid_rows-1:
-                                ofs_x = w - tile_size
-                            if col == grid_cols-1:
-                                ofs_y = h - tile_size
+                        input_list = []
+                        cond_list = []
+                        img_list = []
+                        noise_preds = []
+                        target_feature_list = []
+                        
+                        for row in range(grid_rows):
+                            noise_preds_row = []
+                            for col in range(grid_cols):
+                                if col < grid_cols-1 or row < grid_rows-1:
+                                    # extract tile from input image
+                                    ofs_x = max(row * tile_size-tile_overlap * row, 0)
+                                    ofs_y = max(col * tile_size-tile_overlap * col, 0)
+                                    # input tile area on total image
+                                if row == grid_rows-1:
+                                    ofs_x = w - tile_size
+                                if col == grid_cols-1:
+                                    ofs_y = h - tile_size
 
-                            input_start_x = ofs_x
-                            input_end_x = ofs_x + tile_size
-                            input_start_y = ofs_y
-                            input_end_y = ofs_y + tile_size
+                                input_start_x = ofs_x
+                                input_end_x = ofs_x + tile_size
+                                input_start_y = ofs_y
+                                input_end_y = ofs_y + tile_size
 
-                            # input tile dimensions
-                            input_tile = latent_model_input[:, :, input_start_y:input_end_y, input_start_x:input_end_x]
-                            input_list.append(input_tile)
-                            cond_tile = control_image[:, :, input_start_y:input_end_y, input_start_x:input_end_x]
-                            cond_list.append(cond_tile)
-                            # img_tile = image[:, :, input_start_y*8:input_end_y*8, input_start_x*8:input_end_x*8]
-                            # img_list.append(img_tile)
+                                # input tile dimensions
+                                input_tile = latent_model_input[:, :, input_start_y:input_end_y, input_start_x:input_end_x]
+                                input_list.append(input_tile)
+                                cond_tile = cur_control_image[:, :, input_start_y:input_end_y, input_start_x:input_end_x]
+                                cond_list.append(cond_tile)
+                                # img_tile = image[:, :, input_start_y*8:input_end_y*8, input_start_x*8:input_end_x*8]
+                                # img_list.append(img_tile)
 
-                            if len(input_list) == batch_size or col == grid_cols-1:
-                                input_list_t = torch.cat(input_list, dim=0)
-                                cond_list_t = torch.cat(cond_list, dim=0)
+                                if len(input_list) == batch_size or col == grid_cols-1:
+                                    input_list_t = torch.cat(input_list, dim=0)
+                                    cond_list_t = torch.cat(cond_list, dim=0)
+                                    
+                                    target_features.clear()
+                                    noise_pred = self.transformer(
+                                        hidden_states=input_list_t,
+                                        controlnet_image=cond_list_t,
+                                        timestep=timestep,
+                                        encoder_hidden_states=prompt_embeds_input,
+                                        pooled_projections=pooled_prompt_embeds_input,
+                                        joint_attention_kwargs=self.joint_attention_kwargs,
+                                        return_dict=False,
+                                    )[0]
+                                    if self.do_classifier_free_guidance:
+                                        target_feature_list.append([i_target_feature.chunk(2, dim=0)[1].reshape(-1, feature_tile_size, feature_tile_size, i_target_feature.shape[-1]) for i_target_feature in target_features])
+                                    else:
+                                        target_feature_list.append([i_target_feature.reshape(-1, feature_tile_size, feature_tile_size, i_target_feature.shape[-1]) for i_target_feature in target_features])
+                                    
+                                    #for sample_i in range(model_out.size(0)):
+                                    #    noise_preds_row.append(model_out[sample_i].unsqueeze(0))
+                                    input_list = []
+                                    cond_list = []
+                                    img_list = []
 
-                                # image_embedding = cond_list_t.view(cond_list_t.shape[0], 16, -1)
-                                # prompt_embeds_input = torch.cat([prompt_embeds, image_embedding], dim=-2)
-                                prompt_embeds_input = prompt_embeds
-                                if negative_prompt_embeds is not None:
-                                    # negative_prompt_embeds_input = torch.cat([negative_prompt_embeds, image_embedding], dim=-2)
-                                    negative_prompt_embeds_input = negative_prompt_embeds
+                                noise_preds.append(noise_pred)
 
-                                if self.do_classifier_free_guidance:
-                                    prompt_embeds_input = torch.cat([negative_prompt_embeds_input, prompt_embeds_input], dim=0)
-                                    pooled_prompt_embeds_input = torch.cat([negative_pooled_prompt_embeds, pooled_prompt_embeds], dim=0)
-                                else:
-                                    pooled_prompt_embeds_input = pooled_prompt_embeds
+                        # Stitch noise predictions for all tiles
+                        noise_pred = torch.zeros(latent_model_input.shape, device=latents.device)
+                        contributors = torch.zeros(latent_model_input.shape, device=latents.device)
+                        # Add each tile contribution to overall latents
+                        for row in range(grid_rows):
+                            for col in range(grid_cols):
+                                if col < grid_cols-1 or row < grid_rows-1:
+                                    # extract tile from input image
+                                    ofs_x = max(row * tile_size-tile_overlap * row, 0)
+                                    ofs_y = max(col * tile_size-tile_overlap * col, 0)
+                                    # input tile area on total image
+                                if row == grid_rows-1:
+                                    ofs_x = w - tile_size
+                                if col == grid_cols-1:
+                                    ofs_y = h - tile_size
 
-                                # img_list_t = torch.cat(img_list, dim=0)
-                                #print(input_list_t.shape, cond_list_t.shape, img_list_t.shape, fg_mask_list_t.shape)
+                                input_start_x = ofs_x
+                                input_end_x = ofs_x + tile_size
+                                input_start_y = ofs_y
+                                input_end_y = ofs_y + tile_size
+        
+                                noise_pred[:, :, input_start_y:input_end_y, input_start_x:input_end_x] += noise_preds[row*grid_cols + col] * tile_weights
+                                contributors[:, :, input_start_y:input_end_y, input_start_x:input_end_x] += tile_weights
+                        # Average overlapping areas with more than 1 contributor
+                        noise_pred /= contributors
 
-                                noise_pred = self.transformer(
-                                    hidden_states=input_list_t,
-                                    controlnet_image=cond_list_t,
-                                    timestep=timestep,
-                                    encoder_hidden_states=prompt_embeds_input,
-                                    pooled_projections=pooled_prompt_embeds_input,
-                                    joint_attention_kwargs=self.joint_attention_kwargs,
-                                    return_dict=False,
-                                )[0]
+                        # Stitch target features for all tiles
+                        cur_target_features = [[] for _ in range(len(target_indices))]
+                        
+                        for t_idx in range(len(target_indices)):
+                            stitched_feature = torch.zeros((cur_stride, h//2, w//2, target_features[0].shape[-1]), device=latents.device)
+                            feature_contributors = torch.zeros((cur_stride, h//2, w//2, target_features[0].shape[-1]), device=latents.device)
+                            for row in range(grid_rows):
+                                for col in range(grid_cols):
+                                    if col < grid_cols-1 or row < grid_rows-1:
+                                        # extract tile from input image
+                                        ofs_x = max(row * feature_tile_size - feature_tile_overlap * row, 0)
+                                        ofs_y = max(col * feature_tile_size - feature_tile_overlap * col, 0)
+                                        # input tile area on total image
+                                    if row == grid_rows-1:
+                                        ofs_x = (w // 2) - feature_tile_size
+                                    if col == grid_cols-1:
+                                        ofs_y = (h // 2) - feature_tile_size
 
-                                #for sample_i in range(model_out.size(0)):
-                                #    noise_preds_row.append(model_out[sample_i].unsqueeze(0))
-                                input_list = []
-                                cond_list = []
-                                img_list = []
-
-                            noise_preds.append(noise_pred)
-
-                    # Stitch noise predictions for all tiles
-                    noise_pred = torch.zeros(latent_model_input.shape, device=latents.device)
-                    contributors = torch.zeros(latent_model_input.shape, device=latents.device)
-                    # Add each tile contribution to overall latents
-                    for row in range(grid_rows):
-                        for col in range(grid_cols):
-                            if col < grid_cols-1 or row < grid_rows-1:
-                                # extract tile from input image
-                                ofs_x = max(row * tile_size-tile_overlap * row, 0)
-                                ofs_y = max(col * tile_size-tile_overlap * col, 0)
-                                # input tile area on total image
-                            if row == grid_rows-1:
-                                ofs_x = w - tile_size
-                            if col == grid_cols-1:
-                                ofs_y = h - tile_size
-
-                            input_start_x = ofs_x
-                            input_end_x = ofs_x + tile_size
-                            input_start_y = ofs_y
-                            input_end_y = ofs_y + tile_size
-    
-                            noise_pred[:, :, input_start_y:input_end_y, input_start_x:input_end_x] += noise_preds[row*grid_cols + col] * tile_weights
-                            contributors[:, :, input_start_y:input_end_y, input_start_x:input_end_x] += tile_weights
-                    # Average overlapping areas with more than 1 contributor
-                    noise_pred /= contributors
-
+                                    input_start_x = ofs_x
+                                    input_end_x = ofs_x + feature_tile_size
+                                    input_start_y = ofs_y
+                                    input_end_y = ofs_y + feature_tile_size
+                                    stitched_feature[:, input_start_y:input_end_y, input_start_x:input_end_x, :] += target_feature_list[row*grid_cols + col][t_idx] * feature_tile_weights
+                                    feature_contributors[:, input_start_y:input_end_y, input_start_x:input_end_x, :] += feature_tile_weights
+                                    
+                            # Average overlapping areas with more than 1 contributor
+                            stitched_feature /= feature_contributors
+                            cur_target_features[t_idx].append(stitched_feature)
+                            
+                        target_features.clear()
+                        for t_idx in range(len(target_indices)):
+                            aggregated_feature = torch.cat(cur_target_features[t_idx], dim=0) # (F, HW/4, C)
+                            target_features.append(aggregated_feature)
+                
+                        torch.cuda.empty_cache()
+                        
+                    # Caching noise prediction for each frame
+                    if self.do_classifier_free_guidance:
+                        noise_output = noise_pred.reshape(2, cur_stride, noise_pred.shape[1], noise_pred.shape[2], noise_pred.shape[3])
+                    else:
+                        noise_output = noise_pred.unsqueeze(0)
+                        
+                    for f in range(cur_stride):
+                        idx = start_f + f
+                        cur_pred = noise_output[:, f].clone()
+                        if cached_noise_preds[idx] is None:
+                            cached_noise_preds[idx] = cur_pred
+                        else:
+                            cached_noise_preds[idx] = (cached_noise_preds[idx] + cur_pred) / 2.0
+                    # Cache target features for each frame
+                    for t_idx in range(len(target_indices)):
+                        for f in range(cur_stride):
+                            idx = start_f + f
+                            cur_feature = target_features[t_idx][f].clone()
+                            if cached_target_features[t_idx][idx] is None:
+                                cached_target_features[t_idx][idx] = cur_feature
+                            else:
+                                cached_target_features[t_idx][idx] = (cached_target_features[t_idx][idx] + cur_feature) / 2.0
+                            
+                noise_pred = torch.stack(cached_noise_preds, dim=1) # [2, F, C, H, W] for CFG else [1, F, C, H, W]
+                noise_pred = noise_pred.reshape(-1, noise_pred.shape[2], noise_pred.shape[3], noise_pred.shape[4]) # [2*F, C, H, W] for CFG else [F, C, H, W]
+                
+                target_features = []
+                for t_idx in range(len(target_indices)):
+                    target_feature = torch.stack(cached_target_features[t_idx], dim=0) # [F, H/2, W/2, C]
+                    target_features.append(target_feature)
+                
+                
                 # perform guidance
                 if self.do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                
+                from einops import rearrange
+                from pipelines.propagator import apply_flow_warping
+                
+                apply_warp = (
+                    args is not None
+                    and i >= args.warpping_start_step
+                    and i < args.warpping_end_step
+                    and i < num_steps - 1   
+                )
+                
+                if apply_warp:
+                    # get pred_x0 from v-prediction & perform flow-guided warping
+                    sigma_t = self.scheduler.sigmas[i]
+                    pred_x0 = noise_pred * (-sigma_t) + latents # [F, C, H, W] -> [5, 16, 90, 160]
+                    # breakpoint()
+                    pred_x0_for_decode = (pred_x0 / self.vae.config.scaling_factor) + self.vae.config.shift_factor # [F, 16, H, W]
+                    decoded_frames = []
+                    for i in range(pred_x0_for_decode.shape[0]): 
+                        frame = pred_x0_for_decode[i].unsqueeze(0)  # [1, C, H, W]
+                        with torch.no_grad(): 
+                            rgb = self.vae.decode(frame, return_dict=False)[0]  # [1, 3, H*8, W*8]
+                        decoded_frames.append(rgb)
+                    pred_x0_rgb = torch.cat(decoded_frames, dim=0)  # [F, 3, H*8, W*8]
+                    # pred_x0_rgb = self.vae.decode(pred_x0_for_decode, return_dict=False)[0] # [F, 3, H*8, W*8] -> [5, 3, 720, 1280]
+                    
+                    pred_x0_rgb_5d = pred_x0_rgb.permute(1,0,2,3).unsqueeze(0)  # [F, C, H, W] -> [1, C, F, H, W]
+                    
+                    diffusion_features = target_features
+                    num_frame = original_control_image.shape[0]
+                    
+                    flow_handle_batch = 4
+                    flows_forward_list = []
+                    flows_backward_list = []
+                    
+                    f_idx = 0
+                    while f_idx < num_frame -1:
+                        end_f_idx = min(f_idx + flow_handle_batch, num_frame -1)
+                        current_batch_size = end_f_idx - f_idx
+                        
+                        diff_features_1 = [diffusion_feature[f_idx:f_idx+current_batch_size] for diffusion_feature in diffusion_features]
+                        diff_features_2 = [diffusion_feature[f_idx+1:f_idx+1+current_batch_size] for diffusion_feature in diffusion_features]
+                        
+                        lr_images_1 = original_control_image[f_idx:f_idx+current_batch_size]
+                        lr_images_2 = original_control_image[f_idx+1:f_idx+1+current_batch_size]
+                        
+                        _, flow_forward = self.raft(lr_images_1, lr_images_2, [diff_features_1, diff_features_2], iters=12, test_mode=True)
+                        _, flow_backward = self.raft(lr_images_2, lr_images_1, [diff_features_2, diff_features_1], iters=12, test_mode=True)
+                        
+                        flows_forward_list.append(flow_forward)
+                        flows_backward_list.append(flow_backward)
+                        f_idx += flow_handle_batch
+                        
+                        if f_idx in args.debug_viz_flow_steps and debug_viz:
+                            frame_1 = (lr_images_1[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
+                            frame_2 = (lr_images_2[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype("uint8")
+                            flow_f = flow_forward[0].permute(
+                        
+                    flows_forward = torch.cat(flows_forward_list, dim=0).permute(1,0,2,3).unsqueeze(0)  # [F-1, 2, H, W] -> [1, 2, F-1, H, W] -> [1, 2, 4, 720, 1280]
+                    flows_backward = torch.cat(flows_backward_list, dim=0).permute(1,0,2,3).unsqueeze(0)  # [F-1, 2, H, W] -> [1, 2, F-1, H, W]
+                    
+                    warpped_rgb_5d = apply_flow_warping(
+                        pred_x0_rgb_5d,
+                        flows_forward,
+                        flows_backward,
+                        interpolation='bilinear',
+                        mode='fuse',
+                        fuse_scale=args.fuse_scale,
+                        alpha1=0.001,
+                        alpha2=0.05
+                    ) # [1, C, F, H, W] -> [1, 3, 5, 720, 1280]
+
+                    warpped_rgb = warpped_rgb_5d.squeeze(0).permute(1,0,2,3).contiguous()  # [1, C, F, H, W] -> [F, C, H, W]: [5, 3, 720, 1280]
+
+                    warpped_latent_list = []
+                    with torch.no_grad():
+                        for i in range(warpped_rgb.shape[0]):
+                            frame = warpped_rgb[i].unsqueeze(0)  # [1, 3, H, W]
+                            latent_dist = self.vae.encode(frame).latent_dist
+                            latent = latent_dist.sample()  # [1, 16, H/8, W/8]
+                            warpped_latent_list.append(latent)
+
+                    warpped_pred_x0 = torch.cat(warpped_latent_list, dim=0) 
+                    
+                    # warpped_latent_dist = self.vae.encode(warpped_rgb)
+                    # warpped_pred_x0 = warpped_latent_dist.latent_dist.sample() # [F, 16, H/8, W/8]
+                    warpped_pred_x0 = (warpped_pred_x0 - self.vae.config.shift_factor) * self.vae.config.scaling_factor # [F, C, H/8, W/8]
+                    
+                    noise_pred = (warpped_pred_x0 - latents) / (-sigma_t)
+                    
+                    if debug_viz and (debug_steps is None or i in debug_steps):
+                        with torch.no_grad():
+                            if isinstance(original_control_image, torch.Tensor):
+                                ori = original_control_image.detach().float().cpu()
+                                if ori.ndim == 4 and ori.shape[1] == 3:
+                                    ori = ori  # [F,3,H,W]
+                                elif ori.ndim == 4 and ori.shape[-1] == 3:
+                                    ori = ori.permute(0, 3, 1, 2)
+                            else:
+                                ori = None
+
+                            pred = pred_x0_rgb.detach().float().cpu()          # [F,3,H,W]
+                            warp = warpped_rgb.detach().float().cpu()          # [F,3,H,W]
+
+                            num_frames_show = min(3, pred.shape[0])
+
+                            fig, axes = plt.subplots(3, num_frames_show, figsize=(5*num_frames_show, 12))
+                            if num_frames_show == 1:
+                                axes = axes.reshape(3, 1)
+
+                            for col in range(num_frames_show):
+                                # Row 0: Original control (input frame)
+                                if ori is not None:
+                                    img0 = (ori[col].clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype("uint8")
+                                else:
+                                    img0 = (pred[col].clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype("uint8")
+                                axes[0, col].imshow(img0)
+                                axes[0, col].set_title(f"step {i} | frame {col} | input", fontsize=10, color="white")
+                                axes[0, col].axis("off")
+
+                                # Row 1: pred_x0 before warping
+                                img1 = (pred[col].clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype("uint8")
+                                axes[1, col].imshow(img1)
+                                axes[1, col].set_title("pred_x0", fontsize=10, color="white")
+                                axes[1, col].axis("off")
+
+                                # Row 2: pred_x0 after flow warping
+                                img2 = (warp[col].clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype("uint8")
+                                axes[2, col].imshow(img2)
+                                axes[2, col].set_title("warped pred_x0", fontsize=10, color="white")
+                                axes[2, col].axis("off")
+
+                            fig.patch.set_facecolor("black")
+                            plt.tight_layout()
+
+                            save_path = os.path.join(debug_dir, f"step_{i:03d}.jpg")
+                            plt.savefig(save_path, bbox_inches="tight", pad_inches=0.1)
+                            plt.close(fig)
 
                 # compute the previous noisy sample x_t -> x_t-1
                 latents_dtype = latents.dtype
                 latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
-
+                
                 if latents.dtype != latents_dtype:
                     if torch.backends.mps.is_available():
                         # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
@@ -1200,21 +1518,47 @@ class StableDiffusion3ControlNetPipeline(DiffusionPipeline, SD3LoraLoaderMixin, 
 
                 if XLA_AVAILABLE:
                     xm.mark_step()
-                
+
+        # del all temporary variables to release GPU memory exept 'latents'
+        del noise_pred, pred_x0, warpped_pred_x0, diffusion_features
+        del flows_forward, flows_backward, flows_forward_list, flows_backward_list
+        if 'target_features' in locals():
+            del target_features
+        if 'cached_noise_preds' in locals():
+            del cached_noise_preds
+        if 'cached_target_features' in locals():
+            del cached_target_features
+        
+        for handle in handles:
+            handle.remove()
+        handles.clear()
+            
+        import gc
+        torch.cuda.empty_cache()
+        gc.collect()
 
         if output_type == "latent":
-            image = latents
+            images = latents
 
         else:
-            latents = (latents / self.vae.config.scaling_factor) + self.vae.config.shift_factor
+            images = []
+            for latent in latents:
+                latent = latent.unsqueeze(0)
+                latent = (latent / self.vae.config.scaling_factor) + self.vae.config.shift_factor
 
-            image = self.vae.decode(latents, return_dict=False)[0]
-            image = self.image_processor.postprocess(image, output_type=output_type)
+                image = self.vae.decode(latent, return_dict=False)[0]
+                image = self.image_processor.postprocess(image, output_type=output_type)[0]
+                images.append(image)
+                
+            
+            del image, latent
+            torch.cuda.empty_cache()
 
+        
         # Offload all models
         self.maybe_free_model_hooks()
-
+        
         if not return_dict:
-            return (image,)
+            return (images,)
 
-        return StableDiffusion3PipelineOutput(images=image)
+        return StableDiffusion3PipelineOutput(images=images)

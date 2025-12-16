@@ -24,6 +24,10 @@ stable-diffusion-3.5-medium
 
 latent_diffusion.egg-info
 
+wandb/*
+experiments/*
+preset/*
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

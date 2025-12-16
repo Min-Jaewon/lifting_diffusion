@@ -3,10 +3,40 @@ import os
 import glob
 from tqdm import tqdm
 from transformers import CLIPTokenizer, PretrainedConfig, T5TokenizerFast
-
+from typing import Iterable
 import sys
 sys.path.append(os.getcwd())
 
+def txt_dirs(root: str) -> Iterable[str]:
+    """
+    the expected structure: root/category/unique_id/*.txt
+    """
+    root = os.path.abspath(root)
+    if not os.path.isdir(root):
+        raise NotADirectoryError(f"Root not found: {root}")
+
+    for category in sorted(d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))):
+        category_path = os.path.join(root, category)
+        for unique_id in sorted(d for d in os.listdir(category_path) if os.path.isdir(os.path.join(category_path, d))):
+            uid_path = os.path.join(category_path, unique_id)
+            for video_id in sorted(os.listdir(uid_path)):
+                if video_id.endswith(".txt"):
+                    video_path = os.path.join(uid_path, video_id)
+                    yield video_path
+
+def txt_dirs_val(root: str) -> Iterable[str]:
+    """
+    the expected structure: root/video_id.txt
+    """
+    root = os.path.abspath(root)
+    if not os.path.isdir(root):
+        raise NotADirectoryError(f"Root not found: {root}")
+
+    for video_id in sorted(os.listdir(root)):
+        if video_id.endswith(".txt"):
+            video_path = os.path.join(root, video_id)
+            yield video_path
+                    
 # Copied from dreambooth sd3 example
 def import_model_class_from_model_name_or_path(
     pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
@@ -185,23 +215,22 @@ parser.add_argument(
         default=77,
         help="Maximum sequence length to use with with the T5 text encoder",
     )
-parser.add_argument("--end_num", type=int, default=1)
-parser.add_argument("--start_num", type=int, default=1)
+parser.add_argument("--end_num", type=int, default=-1)
+parser.add_argument("--start_num", type=int, default=39)
 args = parser.parse_args()
 
-
-tag_path = os.path.join(args.root_path, 'prompt')
-prompt_embeds_path = os.path.join(args.root_path, 'prompt_embeds')
-pooled_prompt_embeds_path = os.path.join(args.root_path, 'pooled_prompt_embeds')
+# root directory containing .txt prompts (mirrors category/unique_id/... structure)
+prompt_root = args.root_path
+# output roots for embeddings; will mirror the same internal directory tree as prompt_root
+prompt_embeds_path = prompt_root.replace('prompts', 'prompt_embeds')
+pooled_prompt_embeds_path = prompt_root.replace('prompts', 'pooled_prompt_embeds')
 os.makedirs(prompt_embeds_path, exist_ok=True)
 os.makedirs(pooled_prompt_embeds_path, exist_ok=True)
 
-tag_lists = glob.glob(os.path.join(tag_path, '*.txt'))
-print(f'There are {len(tag_lists)} tags' )
+# collect all .txt files under prompt_root (nested)
+tag_lists = list(txt_dirs_val(prompt_root))
 
-tag_lists = [
-    '/mnt/dataset2/jaewon/YouHQ/YouHQ-Train-prompts/distant/DxP8fc2XYb4/242400_242519_01.txt',
-] 
+print(f'There are {len(tag_lists)} tags' )
 
 # Load the tokenizer
 tokenizer_one = CLIPTokenizer.from_pretrained(
@@ -262,28 +291,44 @@ def compute_text_embeddings(prompt, text_encoders, tokenizers):
 start_num = args.start_num
 end_num = args.end_num
 
+if args.end_num:
+    tag_lists = tag_lists[start_num:end_num]
+
+tag_lists = tag_lists[start_num:]
+tag_lists = [
+    '/mnt/dataset2/jaewon/YouHQ/YouHQ-Train-prompts/distant/DxP8fc2XYb4/242400_242519_01.txt',
+] 
+
+# tag_lists = tag_lists[-30:]  # for testing
+breakpoint()
 print(f'===== process [{start_num}   {end_num}] =====')
 batch_size = 1
 total_tags = len(tag_lists)
 for i in tqdm(range(0, total_tags, batch_size)):
     # 获取当前批次的标签路径
-    batch_tag_paths = tag_lists[i:i + batch_size] if i+batch_size <= total_tags else tag_lists[i:total_tags]
+    batch_tag_paths = tag_lists[i:i + batch_size]
     batch_prompts = []
     valid_tag_paths = []
     save_paths = []
-    for tag_path in batch_tag_paths:
-        basename = os.path.basename(tag_path).split('.')[0]
-        prompt_embeds_save_path = os.path.join(prompt_embeds_path, f'{basename}.pt')
-        pooled_prompt_embeds_save_path = os.path.join(pooled_prompt_embeds_path, f'{basename}.pt')
-
+    for txt_path in batch_tag_paths:
+        # preserve directory structure relative to prompt_root
+        rel_txt = os.path.relpath(txt_path, start=prompt_root)
+        rel_base = os.path.splitext(rel_txt)[0]
+        prompt_embeds_save_path = os.path.join(prompt_embeds_path, f'{rel_base}.pt')
+        pooled_prompt_embeds_save_path = os.path.join(pooled_prompt_embeds_path, f'{rel_base}.pt')
+        
         # 如果嵌入已存在，跳过
         if os.path.exists(prompt_embeds_save_path) and os.path.exists(pooled_prompt_embeds_save_path):
             continue
 
-        with open(tag_path, "r") as f:
+        # ensure nested directories exist for save paths
+        os.makedirs(os.path.dirname(prompt_embeds_save_path), exist_ok=True)
+        os.makedirs(os.path.dirname(pooled_prompt_embeds_save_path), exist_ok=True)
+
+        with open(txt_path, "r") as f:
             prompt = f.read()
             batch_prompts.append(prompt)
-            valid_tag_paths.append(tag_path)
+            valid_tag_paths.append(txt_path)
             save_paths.append((prompt_embeds_save_path, pooled_prompt_embeds_save_path))
     if not batch_prompts:  # 如果当前批次没有需要处理的标签
         continue

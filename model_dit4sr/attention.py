@@ -269,7 +269,8 @@ class JointTransformerBlock(nn.Module):
         self._chunk_dim = dim
 
     def forward(
-        self, hidden_states: torch.FloatTensor, encoder_hidden_states: torch.FloatTensor, temb: torch.FloatTensor
+        self, hidden_states: torch.FloatTensor, encoder_hidden_states: torch.FloatTensor, temb: torch.FloatTensor,
+        is_full_attention=False,
     ):
         if self.use_dual_attention:
             norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp, norm_hidden_states2, gate_msa2 = self.norm1(
@@ -286,10 +287,27 @@ class JointTransformerBlock(nn.Module):
             )
 
         # Attention.
+        from einops import rearrange
+        if is_full_attention:
+            num_frames = 3
+            h_img, h_ctrl = norm_hidden_states.chunk(2, dim=1) 
+            h_img = rearrange(h_img, '(b f) t c -> b (f t) c', f=num_frames).contiguous()
+            h_ctrl = rearrange(h_ctrl, '(b f) t c -> b (f t) c', f=num_frames).contiguous()
+            
+            norm_hidden_states = torch.cat([h_img, h_ctrl], dim=1)
+            norm_encoder_hidden_states = rearrange(norm_encoder_hidden_states, '(b f) t c -> b (f t) c', f=num_frames).contiguous()
+            
         attn_output, context_attn_output = self.attn(
             hidden_states=norm_hidden_states, encoder_hidden_states=norm_encoder_hidden_states,
         )
-
+        if is_full_attention:
+            out_img, out_ctrl = attn_output.chunk(2, dim=1)
+            out_img = rearrange(out_img, 'b (f t) c -> (b f) t c', f=num_frames).contiguous()
+            out_ctrl = rearrange(out_ctrl, 'b (f t) c -> (b f) t c', f=num_frames).contiguous()
+            
+            attn_output = torch.cat([out_img, out_ctrl], dim=1)
+            context_attn_output = rearrange(context_attn_output, 'b (f t) c -> (b f) t c', f=num_frames).contiguous()
+        
         # Process attention outputs for the `hidden_states`.
         attn_output = gate_msa.unsqueeze(1) * attn_output
         hidden_states = hidden_states + attn_output
@@ -444,7 +462,7 @@ class JointAttnProcessor2_0:
             query = torch.cat([query, query_control], dim=2)
             key = torch.cat([key, key_control], dim=2)
             value = torch.cat([value, value_control], dim=2)
-            
+        
         hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
