@@ -4,6 +4,8 @@
 *.pyc
 *.pt
 *.pth
+*.safetensors
+
 
 # directories
 pretrained
@@ -26,7 +28,7 @@ latent_diffusion.egg-info
 
 wandb/*
 experiments/*
-preset/*
+# preset/*
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
