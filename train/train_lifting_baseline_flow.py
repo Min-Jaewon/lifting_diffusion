@@ -1135,7 +1135,7 @@ def main(args):
     train_dataset = VideoPairedCaptionDataset(root_folder=args.root_folders, 
                                          null_text_ratio=args.null_text_ratio,
                                          use_sea_raft = args.use_sea_raft,)
-    train_dataset = Subset(train_dataset, list(range(1)))
+    train_dataset = Subset(train_dataset, list(range(10000)))
     val_dataset = Subset(train_dataset, list(range(0, 3)))
     
     # val_dataset = VideoPairedCaptionDataset(root_folder=args.root_folders, 
