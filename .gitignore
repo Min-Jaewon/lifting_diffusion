@@ -19,10 +19,10 @@ checkpoints
 test_data
 results
 test_data
-dit4sr_f
-dit4sr_q
+# dit4sr_f
+# dit4sr_q
 llava_ckpt
-stable-diffusion-3.5-medium
+# stable-diffusion-3.5-medium
 
 latent_diffusion.egg-info
 

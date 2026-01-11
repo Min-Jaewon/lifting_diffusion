@@ -116,7 +116,7 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
 
         self.gradient_checkpointing = False
-
+        self.target_lifting_layer = None
     # Copied from diffusers.models.unets.unet_3d_condition.UNet3DConditionModel.enable_forward_chunking
     def enable_forward_chunking(self, chunk_size: Optional[int] = None, dim: int = 0) -> None:
         """
@@ -332,7 +332,14 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         for index_block, block in enumerate(self.transformer_blocks):
             # Skip specified layers
             is_skip = True if skip_layers is not None and index_block in skip_layers else False
-            is_full_attention = True if index_block in self.target_lifting_layer else False
+            
+            
+            if self.target_lifting_layer is None: 
+                is_full_attention = False
+            elif index_block in self.target_lifting_layer:
+                is_full_attention = True 
+            else:
+                is_full_attention = False
             
             if torch.is_grad_enabled() and self.gradient_checkpointing and not is_skip:
 

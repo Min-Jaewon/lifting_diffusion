@@ -1010,6 +1010,7 @@ def main(args):
             else:
                 # [B, 2, 2048, 1536] -> [B, 1024, 1536] 
                 feature = input[0].chunk(2, dim=1)[0]
+            breakpoint()
             target_features.append(feature)
         return hook 
         

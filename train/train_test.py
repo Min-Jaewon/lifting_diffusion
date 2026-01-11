@@ -990,13 +990,11 @@ def main(args):
             args.trainable_modules.append(f'transformer_blocks.{layer}.attn')
     transformer.target_lifting_layer = args.target_lifting_layer
     for name, params in transformer.named_parameters():
-        # print(name)
         # if name.endswith(tuple(args.trainable_modules)):
         if any(trainable_modules in name for trainable_modules in tuple(args.trainable_modules)):
             print(f'{name} in <transformer> will be optimized.' )
             # for params in module.parameters():
             params.requires_grad = True
-            
     # raft_parameters = list(filter(lambda p: p.requires_grad, raft.parameters()))
     transformer_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
     # num_trainable_params = sum(p.numel() for p in raft_parameters) + sum(p.numel() for p in transformer_parameters)
@@ -1122,7 +1120,7 @@ def main(args):
                                          null_text_ratio=args.null_text_ratio,
                                          use_sea_raft = args.use_sea_raft,)
     train_dataset = Subset(train_dataset, list(range(10000)))
-    val_dataset = Subset(train_dataset, list(range(0, 3)))
+    val_dataset = Subset(train_dataset, list(range(10000, 10010)))
     
     # val_dataset = VideoPairedCaptionDataset(root_folder=args.root_folders, 
     #                                    use_sea_raft = args.use_sea_raft,
@@ -1273,7 +1271,7 @@ def main(args):
                 
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(model_input)
-                bsz = model_input.shape[0] // 3
+                bsz = args.train_batch_size
                 # Sample a random timestep for each image
                 # for weighting schemes where we sample timesteps non-uniformly
                 u = compute_density_for_timestep_sampling(
@@ -1289,7 +1287,6 @@ def main(args):
                 # Add noise according to flow matching.
                 # zt = (1 - texp) * x + texp * z1
                 sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
-                
                 noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
                 # input_model_input = torch.cat([noisy_model_input, controlnet_image], dim = 1)
 
@@ -1323,6 +1320,7 @@ def main(args):
                 #     torch.ones_like(flow_gt[:, :1, :, :]),
                 #     0.8,
                 # )
+                
                 # Follow: Section 5 of https://arxiv.org/abs/2206.00364.
                 # Preconditioning of the model outputs.
                 if args.precondition_outputs:

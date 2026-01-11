@@ -186,7 +186,9 @@ class RAFT_Diff(nn.Module):
         if args.feature_upsample == 'dpt':
             # Upsample using DPTHead
             if args.use_custom_dpt:
-                self.upsampler = CustomDPTHead(dim_in=1536, features=args.conv_1x1_channels, feature_only=True)
+                import copy 
+                self.upsampler_query = CustomDPTHead(dim_in=1536, features=args.conv_1x1_channels, feature_only=True) 
+                self.upsampler_key = copy.deepcopy(self.upsampler_query)
             else:
                 self.upsampler = DPTHead(dim_in=1536, features=args.conv_1x1_channels, feature_only=True)
             
@@ -236,7 +238,7 @@ class RAFT_Diff(nn.Module):
         return up_flow.reshape(N, 2, 8*H, 8*W)
 
     
-    def forward(self, image1, image2, features, iters=12, flow_init=None, upsample=True, test_mode=False,):
+    def forward(self, image1, image2, features, iters=12, flow_init=None, upsample=True, test_mode=False, is_qk_features=False):
         """ Estimate optical flow between pair of frames """
         H, W = image1.shape[-2:]
         image1 = image1.contiguous()
@@ -250,10 +252,15 @@ class RAFT_Diff(nn.Module):
         feat2 =[]
         
         if not test_mode:
-            for layer_feature in features:
-                reshaped_features = rearrange(layer_feature, '(b f) c d -> b f c d', f=2)
-                feat1.append(reshaped_features[:,0,:,:].permute(0,2,1).reshape(-1, 1536, 32,32)) # (B, 1024, 1536) -> (B, 1536, 32, 32)
-                feat2.append(reshaped_features[:,1,:,:].permute(0,2,1).reshape(-1, 1536, 32,32)) # (B, 1024, 1536) -> (B, 1536, 32, 32)
+            if is_qk_features:
+                feat1 = [f.permute(0,2,1).reshape(-1, 1536, 32,32) for f in features[0]]  # (B, 1024, 1536) -> (B, 1536, 32, 32) Query features
+                feat2 = [f.permute(0,2,1).reshape(-1, 1536, 32,32) for f in features[1]]  # (B, 1024, 1536) -> (B, 1536, 32, 32) Key features
+            else:
+                for layer_feature in features:
+                    reshaped_features = rearrange(layer_feature, '(b f) c d -> b f c d', f=2)
+                    feat1.append(reshaped_features[:,0,:,:].permute(0,2,1).reshape(-1, 1536, 32,32)) # (B, 1024, 1536) -> (B, 1536, 32, 32)
+                    feat2.append(reshaped_features[:,1,:,:].permute(0,2,1).reshape(-1, 1536, 32,32)) # (B, 1024, 1536) -> (B, 1536, 32, 32)
+
         else:
             feat1 = features[0]
             feat2 = features[1]
@@ -274,8 +281,13 @@ class RAFT_Diff(nn.Module):
             fmap2 = self.upsampler(feat2)  # (B, 1536, 32, 32) -> (B, 128, 64, 64)
             
         elif self.args.feature_upsample == 'dpt':
-            fmap1 = self.upsampler(feat1, image1)
-            fmap2 = self.upsampler(feat2, image2)
+            if is_qk_features:
+                fmap1 = self.upsampler_query(feat1, image1)
+                fmap2 = self.upsampler_key(feat2, image2)
+            else:
+                raise NotImplementedError("Currently only support is_qk_features=True for DPT upsampler.")
+                fmap1 = self.upsampler(feat1, image1)
+                fmap2 = self.upsampler(feat2, image2)
         
         if self.use_l2_norm:
             fmap1 = F.normalize(fmap1, p=2, dim=1)

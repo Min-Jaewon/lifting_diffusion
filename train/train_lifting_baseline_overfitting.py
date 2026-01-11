@@ -52,7 +52,7 @@ from dataloaders.paired_dataset_sd3_latent import PairedCaptionDataset
 import RAFT.raft_tools as raft_tools
 from RAFT.core.raft import RAFT
 from RAFT.core.utils import flow_viz
-from dataloaders.paired_dataset_sd3_latent_baseline import VideoPairedCaptionDataset, collate_fn
+from dataloaders.paired_dataset_sd3_latent_baseline_overfitting import VideoPairedCaptionDataset, collate_fn
 from einops import rearrange, repeat
 from torch.utils.data import Subset
 import re
@@ -990,13 +990,13 @@ def main(args):
             args.trainable_modules.append(f'transformer_blocks.{layer}.attn')
     transformer.target_lifting_layer = args.target_lifting_layer
     for name, params in transformer.named_parameters():
-        # print(name)
+        print(name)
         # if name.endswith(tuple(args.trainable_modules)):
         if any(trainable_modules in name for trainable_modules in tuple(args.trainable_modules)):
             print(f'{name} in <transformer> will be optimized.' )
             # for params in module.parameters():
             params.requires_grad = True
-            
+    
     # raft_parameters = list(filter(lambda p: p.requires_grad, raft.parameters()))
     transformer_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
     # num_trainable_params = sum(p.numel() for p in raft_parameters) + sum(p.numel() for p in transformer_parameters)
@@ -1121,7 +1121,7 @@ def main(args):
     train_dataset = VideoPairedCaptionDataset(root_folder=args.root_folders, 
                                          null_text_ratio=args.null_text_ratio,
                                          use_sea_raft = args.use_sea_raft,)
-    train_dataset = Subset(train_dataset, list(range(10000)))
+    # train_dataset = Subset(train_dataset, list(range(1)))
     val_dataset = Subset(train_dataset, list(range(0, 3)))
     
     # val_dataset = VideoPairedCaptionDataset(root_folder=args.root_folders, 

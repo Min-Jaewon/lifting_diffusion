@@ -12,7 +12,7 @@ accelerate launch --config_file single-gpu.yaml --main_process_port 29503 train/
     --root_folders="/mnt/dataset3/jaewon/YouHQ/YouHQ-Train" \
     --mixed_precision="fp16" \
     --learning_rate ${LR} \
-    --train_batch_size 1 \
+    --train_batch_size 2 \
     --gradient_accumulation_steps=1 \
     --null_text_ratio=0.0 \
     --dataloader_num_workers=0 \

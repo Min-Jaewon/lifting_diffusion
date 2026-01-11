@@ -52,6 +52,7 @@ if is_torch_xla_available():
 else:
     XLA_AVAILABLE = False
 
+from einops import rearrange
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -1121,7 +1122,10 @@ class StableDiffusion3ControlNetPipeline(DiffusionPipeline, SD3LoraLoaderMixin, 
                         start_f = max(0, end_f - chunck_size)
                         cur_stride = end_f - start_f
                     
-                    cur_control_image = control_image[:, start_f:end_f].clone() # [2, cur_F, C, H, W] for CFG else [cur_F, C, H, W]
+                    if self.do_classifier_free_guidance:
+                        cur_control_image = control_image[:, start_f:end_f].clone() # [2, cur_F, C, H, W] for CFG 
+                    else:   #else [cur_F, C, H, W]
+                        cur_control_image = control_image[start_f:end_f].clone() # [cur_F, C, H, W]
                     latent_model_input = latents[start_f:end_f].clone() # [cur_F, C, H, W]
                             
                     cur_prompt_embeds_input = prompt_embeds.repeat(cur_stride, 1, 1)
@@ -1137,6 +1141,7 @@ class StableDiffusion3ControlNetPipeline(DiffusionPipeline, SD3LoraLoaderMixin, 
                         prompt_embeds_input = torch.cat([negative_prompt_embeds_input, cur_prompt_embeds_input], dim=0)
                         pooled_prompt_embeds_input = torch.cat([negative_pooled_prompt_embeds_input, cur_pooled_prompt_embeds_input], dim=0)
                     else:
+                        prompt_embeds_input = cur_prompt_embeds_input
                         pooled_prompt_embeds_input = pooled_prompt_embeds
                         
                     timestep = t.expand(latent_model_input.shape[0])
@@ -1146,7 +1151,6 @@ class StableDiffusion3ControlNetPipeline(DiffusionPipeline, SD3LoraLoaderMixin, 
                         # controlnet(s) inference
                         
                         target_features.clear()
-                        
                         noise_pred = self.transformer(
                             hidden_states=latent_model_input,
                             controlnet_image=cur_control_image,
@@ -1303,7 +1307,7 @@ class StableDiffusion3ControlNetPipeline(DiffusionPipeline, SD3LoraLoaderMixin, 
                         
                     # Caching noise prediction for each frame
                     if self.do_classifier_free_guidance:
-                        noise_output = noise_pred.reshape(2, cur_stride, noise_pred.shape[1], noise_pred.shape[2], noise_pred.shape[3])
+                        noise_output = rearrange(noise_pred, '(guidance bf) c h w -> guidance bf c h w', guidance=2)
                     else:
                         noise_output = noise_pred.unsqueeze(0)
                         
@@ -1342,12 +1346,12 @@ class StableDiffusion3ControlNetPipeline(DiffusionPipeline, SD3LoraLoaderMixin, 
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
                 
-                from einops import rearrange
+                
                 from pipelines.propagator import apply_flow_warping
                 
                 modified_fuse_scale = args.fuse_scale
                 
-                if i >= args.warpping_start_step and i < args.warpping_end_step:
+                if i >= args.warpping_start_step and i < args.warpping_end_step and args.target_lifting_layer is None:
                     if args.warping_mode == 'sigma_scaling':
                         sigma_t = self.scheduler.sigmas[i]
                         sigmax = self.scheduler.sigmas[0]
@@ -1449,9 +1453,10 @@ class StableDiffusion3ControlNetPipeline(DiffusionPipeline, SD3LoraLoaderMixin, 
 
 
         # del all temporary variables to release GPU memory exept 'latents'
-        del noise_pred, pred_x0, warpped_pred_x0, diffusion_features
-        del flows_forward, flows_backward, flows_forward_list, flows_backward_list
-        del target_features
+        if args.target_lifting_layer is None:
+            del noise_pred, pred_x0, warpped_pred_x0, diffusion_features
+            del flows_forward, flows_backward, flows_forward_list, flows_backward_list
+            del target_features
         torch.cuda.empty_cache()
         
         if args.cpu_offload:

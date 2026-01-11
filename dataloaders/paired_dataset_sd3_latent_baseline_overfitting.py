@@ -64,7 +64,7 @@ class VideoPairedCaptionDataset(data.Dataset):
         self.null_text_ratio = null_text_ratio 
         self.use_sea_raft = use_sea_raft
         self.rel_path_list = self.iter_frames_dirs(root_folder) if not val else self.iter_frames_dirs_val(root_folder)
-        self.rel_path_list = self.rel_path_list
+        self.rel_path_list = self.rel_path_list[:1] # For overfitting test
         self.root_folder = root_folder
         self.ref_image_idxs = self.get_frame_indices()
         
@@ -108,16 +108,17 @@ class VideoPairedCaptionDataset(data.Dataset):
         return video_path_list
             
     def get_frame_indices(self):
-        ref_image_idxs = []
-        for video_path in self.rel_path_list:
-            video_length = 30
-            ref_image_idxs.append(random.randint(1, video_length - 2)) # Start from 1 to avoid the first frame
+        video_length = 30  # Assuming each video has 30 frames for this example
+        ref_image_idxs = [_ for _ in range(1, video_length -2)]
+        # for video_path in self.rel_path_list:
+        #     video_length = 30
+        #     ref_image_idxs.append(random.randint(1, video_length - 2)) # Start from 1 to avoid the first frame
         
         return ref_image_idxs
     
     def __getitem__(self, index):
 
-        rel_path = self.rel_path_list[index]
+        rel_path = self.rel_path_list[0]
         # # Debugging
         # frame_idx = self.ref_image_idxs[index]
         # return {'video_id': rel_path, 'frame_idx': frame_idx}
@@ -228,7 +229,7 @@ class VideoPairedCaptionDataset(data.Dataset):
         return example
 
     def __len__(self):
-        return len(self.rel_path_list)
+        return len(self.ref_image_idxs)
     
 if __name__ == "__main__":
     seed= 42
@@ -247,7 +248,7 @@ if __name__ == "__main__":
     #     val=True,
     # )
     # Check Loading
-    dataset= Subset(dataset, list(range(1)))  # Use a subset for quick testing
+    # dataset= Subset(dataset, list(range(1)))  # Use a subset for quick testing
     print(f"Dataset length: {len(dataset)}")
     sample = dataset[0]
     print(f"Sample keys: {sample.keys()}")

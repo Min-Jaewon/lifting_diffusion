@@ -311,8 +311,23 @@ class JointTransformerBlock(nn.Module):
         # Process attention outputs for the `hidden_states`.
         attn_output = gate_msa.unsqueeze(1) * attn_output
         hidden_states = hidden_states + attn_output
+        
         if self.use_dual_attention:
+            if is_full_attention:
+                h_img, h_ctrl = norm_hidden_states2.chunk(2, dim=1) 
+                h_img = rearrange(h_img, '(b f) t c -> b (f t) c', f=num_frames).contiguous()
+                h_ctrl = rearrange(h_ctrl, '(b f) t c -> b (f t) c', f=num_frames).contiguous()
+                
+                norm_hidden_states2 = torch.cat([h_img, h_ctrl], dim=1)
+            
             attn_output2 = self.attn2(hidden_states=norm_hidden_states2)
+            
+            if is_full_attention:
+                out_img, out_ctrl = attn_output2.chunk(2, dim=1)
+                out_img = rearrange(out_img, 'b (f t) c -> (b f) t c', f=num_frames).contiguous()
+                out_ctrl = rearrange(out_ctrl, 'b (f t) c -> (b f) t c', f=num_frames).contiguous()
+                
+                attn_output2 = torch.cat([out_img, out_ctrl], dim=1)
             attn_output2 = gate_msa2.unsqueeze(1) * attn_output2
             hidden_states = hidden_states + attn_output2
 
@@ -412,7 +427,6 @@ class JointAttnProcessor2_0:
         query = attn.to_q(hidden_states)
         key = attn.to_k(hidden_states)
         value = attn.to_v(hidden_states)
-
         inner_dim = key.shape[-1]
         head_dim = inner_dim // attn.heads
 

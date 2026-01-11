@@ -304,7 +304,7 @@ def main(args):
                 frames = padded_frames
             
             # frames = frames[:5] # For debugging, use only 5 frames
-            
+            # frames = frames[20:23]
             # print(f'Prompt: {validation_prompt}')
             width, height = frames[0].size
 
