@@ -985,9 +985,9 @@ def main(args):
     # raft.requires_grad_(True) # Default: train RAFT model
     # if not args.only_train_raft:
         # release the cross-attention part in the unet.
-    if args.target_lifting_layer is not None:
-        for layer in args.target_lifting_layer:
-            args.trainable_modules.append(f'transformer_blocks.{layer}.attn')
+    # if args.target_lifting_layer is not None:
+    #     for layer in args.target_lifting_layer:
+    #         args.trainable_modules.append(f'transformer_blocks.{layer}.attn')
     transformer.target_lifting_layer = args.target_lifting_layer
     for name, params in transformer.named_parameters():
         # print(name)

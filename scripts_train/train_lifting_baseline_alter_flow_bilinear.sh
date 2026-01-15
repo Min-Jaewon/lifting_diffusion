@@ -1,8 +1,8 @@
-export CUDA_VISIBLE_DEVICES=2,3
+export CUDA_VISIBLE_DEVICES=6,7
 
 LR=5e-5
 CHANNELS=256
-WANDB_NAME="[Baseline+Flow]_Later_16_18_20_22_lr${LR}"
+WANDB_NAME="[Baseline+Flow]_Later_16_18_20_22_lr${LR}_Bilinear"
 # Final : DPT + Vision Encoder + SEA-RAFT + Custom DPT + Context DPT
 python -m accelerate.commands.launch --config_file multi-gpu.yaml --main_process_port 29510 train/train_lifting_baseline_flow.py \
     --report_to wandb \
@@ -19,6 +19,7 @@ python -m accelerate.commands.launch --config_file multi-gpu.yaml --main_process
     --dataloader_num_workers=0 \
     --target_lifting_layer 16 18 20 22 \
     --target_modules 'attn.to_q' 'attn.to_k' \
+    --feature_upsample bilinear \
     --target_indices 16 18 20 22 \
     --checkpointing_steps 25000 \
     --checkpoints_total_limit 4 \

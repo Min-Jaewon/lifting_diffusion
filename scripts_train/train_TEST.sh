@@ -1,26 +1,22 @@
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=7
 # export WANDB_MODE='disabled'
 
 LR=5e-5
 CHANNELS=256
-WANDB_NAME="[OVERFIT_TEST]layer_16/18/20/22_lr${LR}"
+WANDB_NAME="TEST"
 # Final : DPT + Vision Encoder + SEA-RAFT + Custom DPT + Context DPT
-python -m accelerate.commands.launch --config_file single-gpu.yaml --main_process_port 29503 train/train_lifting_baseline_flow.py \
+python -m accelerate.commands.launch --config_file single-gpu.yaml --main_process_port 29510 train/train_lifting_baseline_addfullattn.py \
     --report_to wandb \
     --pretrained_model_name_or_path="preset/models/stable-diffusion-3.5-medium" \
-    --transformer_model_name_or_path="preset/models/dit4sr_q" \
+    --transformer_model_name_or_path="preset/models/dit4sr_q_ours" \
     --output_dir="./experiments/${WANDB_NAME}" \
     --root_folders="/media/data1/jaewon/YouHQ/YouHQ-Train" \
     --mixed_precision="fp16" \
     --learning_rate ${LR} \
-    --trainable_modules control_conv \
-    --train_batch_size 2 \
+    --train_batch_size 1 \
     --gradient_accumulation_steps=1 \
-    --null_text_ratio=0.0 \
+    --null_text_ratio=0.2 \
     --dataloader_num_workers=0 \
-    --target_lifting_layer 16 18 20 22 \
-    --target_modules 'attn.to_q' 'attn.to_k' \
-    --target_indices 16 18 20 22 \
     --checkpointing_steps 25000 \
     --checkpoints_total_limit 4 \
     --validation_steps 1 \

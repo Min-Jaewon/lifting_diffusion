@@ -40,7 +40,7 @@ from diffusers import (
     StableDiffusion3ControlNetPipeline,
     StableDiffusion3Pipeline,
 )
-from model_dit4sr.transformer_sd3 import SD3Transformer2DModel
+from model_dit4sr.transformer_sd3_ours import SD3Transformer2DModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3, free_memory, cast_training_params
 from diffusers.utils import check_min_version, is_wandb_available
@@ -52,7 +52,7 @@ from dataloaders.paired_dataset_sd3_latent import PairedCaptionDataset
 import RAFT.raft_tools as raft_tools
 from RAFT.core.raft import RAFT
 from RAFT.core.utils import flow_viz
-from dataloaders.paired_dataset_sd3_latent_baseline import VideoPairedCaptionDataset, collate_fn
+from dataloaders.paired_dataset_sd3_latent_baseline_overfitting import VideoPairedCaptionDataset, collate_fn
 from einops import rearrange, repeat
 from torch.utils.data import Subset
 import re
@@ -406,9 +406,9 @@ def parse_args(input_args=None):
     parser.add_argument('--trainable_modules', nargs='*', type=str, default=[])
     
     # Newly added
-    parser.add_argument("--raft_model_path", type=str, default='./RAFT/models/raft-things.pth', help="Path to pretrained RAFT model.")
+    parser.add_argument("--raft_model_path", type=str, default='/mnt/dataset1/m_jaewon/cvpr26/DiT4SR/RAFT/models/raft-things.pth', help="Path to pretrained RAFT model.")
     parser.add_argument("--only_train_raft", action="store_true", help="Whether or not to only train RAFT model.")
-    parser.add_argument("--feature_upsample", type=str, choices=['bilinear', 'conv', 'dpt'], default='dpt', help="Feature upsample method in RAFT.")
+    parser.add_argument("--feature_upsample", type=str, choices=['bilinear', 'conv', 'dpt'], default='bilinear', help="Feature upsample method in RAFT.")
     parser.add_argument("--target_modules", nargs='*', type=str, default=['ff'], help="Target modules to extract features in DiT4SR.")
     parser.add_argument("--target_indices", nargs='*', type=int, default=[23], help="Target layer indices to extract features in DiT4SR.")
     parser.add_argument("--wandb_project", type=str, default='DiT4SR', help="Weights and Biases project name.")
@@ -417,12 +417,12 @@ def parse_args(input_args=None):
     parser.add_argument("--dataset_size", type=int, default=10000, help="Number of samples in the training dataset.")
     parser.add_argument("--stage1_raft_weight", type=str, default=None, help="Path to the pretrained RAFT weights from stage 1.")
     parser.add_argument("--flow_loss_weight", type=float, default=1.0, help="Weight for flow loss.")
-    parser.add_argument("--use_raft_encoder", action="store_true", default=True, help="Whether to use RAFT encoder features.")
+    parser.add_argument("--use_raft_encoder", action="store_true", default=False, help="Whether to use RAFT encoder features.")
     parser.add_argument("--conv_1x1_channels", type=int, default=256, help="Number of output channels for 1x1 conv")
     parser.add_argument("--use_sea_raft", action="store_true", default=False, help="Whether to use SEA-RAFT for optical flow estimation.")
     parser.add_argument("--use_l2_norm", action="store_true", default=False, help="Whether to L2 normalize the extracted features from RAFT.")
-    parser.add_argument("--use_context_dpt", action="store_true", default=True, help="Whether to use DPTHead to extract context features.")
-    parser.add_argument("--use_custom_dpt", action="store_true", default=True, help="Whether to use CustomDPTHead for context features.")
+    parser.add_argument("--use_context_dpt", action="store_true", default=False, help="Whether to use DPTHead to extract context features.")
+    parser.add_argument("--use_custom_dpt", action="store_true", default=False, help="Whether to use CustomDPTHead for context features.")
     parser.add_argument("--target_lifting_layer", nargs="*", type=int, default=None, help="Target lifting layer indices.")
     # Parse the arguments
     if input_args is not None:
@@ -598,20 +598,20 @@ def viz(gt_img,lq_img, flow_pred, flow_gt, flow_lq=None):
     flow_gt:   (B, 2, H, W) 또는 (B, H, W, 2), optical flow ground truth
     flow_lq:   (B, 2, H, W) 또는 (B, H, W, 2), optical flow low-quality (입력) --- 선택적 ---
     """
-    b = gt_img.shape[0] // 3 # 배치 크기 절반 (두 프레임씩 묶여있음)
+    b = gt_img.shape[0] //2 # 배치 크기 절반 (두 프레임씩 묶여있음)
     results = []
     gt_img = rearrange(gt_img, '(b f) c h w -> b f c h w', f=3)
     lq_img = rearrange(lq_img, '(b f) c h w -> b f c h w', f=3)
     
     for i in range(b):
         # --- 원본 이미지 ---
-        gt_img_i = gt_img[i][1].permute(1, 2, 0).detach().cpu().numpy() # 첫 번째 프레임 선택
+        gt_img_i = gt_img[i][0].permute(1, 2, 0).detach().cpu().numpy() # 첫 번째 프레임 선택
         # gt_img_i = (gt_img_i * 0.5 + 0.5)              # [-1,1] → [0,1]
         gt_img_i = np.clip(gt_img_i, 0, 1)
         gt_img_i = (gt_img_i * 255).astype(np.uint8)
         
         # --- LQ 이미지 ---
-        lq_img_i = lq_img[i][1].permute(1, 2, 0).detach().cpu().numpy()
+        lq_img_i = lq_img[i][0].permute(1, 2, 0).detach().cpu().numpy()
         # lq_img_i = (lq_img_i * 0.5 + 0.5)              # [-1,1] → [0,1]
         lq_img_i = np.clip(lq_img_i, 0, 1)
         lq_img_i = (lq_img_i * 255).astype(np.uint8)
@@ -710,8 +710,6 @@ def validation_loop(args, accelerator, transformer, raft, val_dataloader, weight
             lr_image2 = rearrange(lr_image, '(b f) c h w -> b f c h w', f=3)[:,1,:,:,:] # take the second frame
             
             flow_preds = raft(lr_image1, lr_image2, diffusion_features, iters=12,)
-            
-            # 
             flow_gt = batch['gt_flow'].to(device, dtype=model_input.dtype)
             
             flow_loss, metrics = raft_tools.sequence_loss(
@@ -925,6 +923,20 @@ def main(args):
             args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
         )
     transformer.requires_grad_(False)
+    for i in range(13, 24):
+        block = transformer.transformer_blocks[i]
+        # attn2 or tempor
+        module = None
+        if hasattr(block, 'attn2'):
+            module = block.attn2
+    
+        if module is not None:
+            for name, param in module.named_parameters():
+                param.zero_()
+                param.requires_grad = True
+            print(f'transformer block {i} attn2set to trainable with zero initialization.')
+        else:
+            raise ValueError(f'transformer block {i} has no attn2 module.')
     
     # Load VAE
     if not args.only_train_raft:
@@ -935,93 +947,81 @@ def main(args):
         vae.requires_grad_(False)
     
     # # Feature Extraction Hooks
-    # target_modules = args.target_modules 
-    # Input of 'norm2' -> Pre-AdaLN
-    # Input of 'ff' -> Post-AdaLN 
+    # target_modules = args.target_modules # Input of 'norm2' -> Pre-AdaLN, Input of 'ff' -> Post-AdaLN
+    # pattern = rf"transformer_blocks\.(\d+)\.(?:{'|'.join(target_modules)})$"
+    # target_indices = args.target_indices
+    # target_features = []
     
-    # Output of 'attn.to_q' -> Query Feature
-    # Output of 'attn.to_k' -> Key Feature
-    escaped_modules = [re.escape(m) for m in args.target_modules]
-    pattern = rf"transformer_blocks\.(\d+)\.(?:{'|'.join(escaped_modules)})$"
-    target_indices = args.target_indices
-    target_features = []
-    
-    ## Hooks for feature extraction
-    def get_input_hook(name):
-        print(f'Registering hook for {name}')
-        def hook(module, input, output):
-            # [B, 2, 2048, 1536] -> [B, 1024, 1536] 
-            # feature = input[0].chunk(2, dim=1)[0] # CVPR26 Version
-            feature = output # ICML26 Version - Query/Key feature from Full Attention
-            target_features.append(feature)
-        return hook
+    # ## Hooks for feature extraction
+    # def get_input_hook(name):
+    #     def hook(module, input, output):
+    #         # [B, 2, 2048, 1536] -> [B, 1024, 1536] 
+    #         feature = input[0].chunk(2, dim=1)[0]
+    #         target_features.append(feature)
+    #     return hook
         
-    def register_hooks(model, indices=None):
-        handles = []
-        for name, module in model.named_modules():
-            is_match = re.match(pattern, name)
-            if is_match:
-                block_idx = int(name.split('.')[1])
-                if block_idx in indices:
-                    handle = module.register_forward_hook(get_input_hook(name))
-                    handles.append(handle)
+    # def register_hooks(model, indices=None):
+    #     handles = []
+    #     for name, module in model.named_modules():
+    #         is_match = re.match(pattern, name)
+    #         if is_match:
+    #             block_idx = int(name.split('.')[1])
+    #             if block_idx in indices:
+    #                 handle = module.register_forward_hook(get_input_hook(name))
+    #                 handles.append(handle)
                     
-        return handles
+    #     return handles
     
-    handles = register_hooks(transformer, target_indices)
+    # handles = register_hooks(transformer, target_indices)
     
     # # Load RAFT model for optical flow extraction
-    if args.stage1_raft_weight is not None:
-        raft = raft_tools.get_raft_model(args.stage1_raft_weight,
-                                         mixed_precision=args.mixed_precision,
-                                         feature_upsample=args.feature_upsample,
-                                         use_raft_encoder=args.use_raft_encoder,
-                                         conv_1x1_channels=args.conv_1x1_channels,
-                                         use_l2_norm=args.use_l2_norm,
-                                         use_context_dpt=args.use_context_dpt,
-                                         use_custom_dpt=args.use_custom_dpt,)
-        logger.info(f'Loaded pretrained RAFT weights from {args.stage1_raft_weight} for stage 2 training.')
-    else:
-        raft = raft_tools.get_raft_model(args.raft_model_path,
-                                     mixed_precision=args.mixed_precision,
-                                     feature_upsample=args.feature_upsample,
-                                     use_raft_encoder=args.use_raft_encoder,
-                                     conv_1x1_channels=args.conv_1x1_channels,
-                                     use_l2_norm=args.use_l2_norm,
-                                     use_context_dpt=args.use_context_dpt,
-                                     use_custom_dpt=args.use_custom_dpt,)
-    flow_extractor = raft_tools.get_raft_model(args.raft_model_path,
-                                               mixed_precision=args.mixed_precision,
-                                               is_flow_extractor=True,)     
-    
-    raft.requires_grad_(True) # Default: train RAFT model 
-    flow_extractor.requires_grad_(False)       
+    # if args.stage1_raft_weight is not None:
+    #     raft = raft_tools.get_raft_model(args.stage1_raft_weight,
+    #                                      mixed_precision=args.mixed_precision,
+    #                                      feature_upsample=args.feature_upsample,
+    #                                      use_raft_encoder=args.use_raft_encoder,
+    #                                      conv_1x1_channels=args.conv_1x1_channels,
+    #                                      use_l2_norm=args.use_l2_norm,
+    #                                      use_context_dpt=args.use_context_dpt,
+    #                                      use_custom_dpt=args.use_custom_dpt,)
+    #     logger.info(f'Loaded pretrained RAFT weights from {args.stage1_raft_weight} for stage 2 training.')
+    # else:
+    #     raft = raft_tools.get_raft_model(args.raft_model_path,
+    #                                  mixed_precision=args.mixed_precision,
+    #                                  feature_upsample=args.feature_upsample,
+    #                                  use_raft_encoder=args.use_raft_encoder,
+    #                                  conv_1x1_channels=args.conv_1x1_channels,
+    #                                  use_l2_norm=args.use_l2_norm,
+    #                                  use_context_dpt=args.use_context_dpt,
+    #                                  use_custom_dpt=args.use_custom_dpt,)
+                               
     # Set which modules to train
+    # raft.requires_grad_(True) # Default: train RAFT model
     # if not args.only_train_raft:
         # release the cross-attention part in the unet.
-    if args.target_lifting_layer is not None:
-        for layer in args.target_lifting_layer:
-            args.trainable_modules.append(f'transformer_blocks.{layer}.attn')
+    # if args.target_lifting_layer is not None:
+    #     for layer in args.target_lifting_layer:
+    #         args.trainable_modules.append(f'transformer_blocks.{layer}.attn')
     transformer.target_lifting_layer = args.target_lifting_layer
     for name, params in transformer.named_parameters():
         # print(name)
         # if name.endswith(tuple(args.trainable_modules)):
         if any(trainable_modules in name for trainable_modules in tuple(args.trainable_modules)):
-            # print(f'{name} in <transformer> will be optimized.' )
+            print(f'{name} in <transformer> will be optimized.' )
             # for params in module.parameters():
             params.requires_grad = True
-
-    raft_parameters = list(filter(lambda p: p.requires_grad, raft.parameters()))
+            
+    # raft_parameters = list(filter(lambda p: p.requires_grad, raft.parameters()))
     transformer_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
-    num_trainable_params = sum(p.numel() for p in raft_parameters) + sum(p.numel() for p in transformer_parameters)
-    # num_trainable_params = sum(p.numel() for p in transformer_parameters)
+    # num_trainable_params = sum(p.numel() for p in raft_parameters) + sum(p.numel() for p in transformer_parameters)
+    num_trainable_params = sum(p.numel() for p in transformer_parameters)
     
     # if args.only_train_raft:
     #     logger.info(f"** Only training RAFT model ***")
     # else:
     #     logger.info(f"Training both RAFT and Transformer model")
     logger.info(f"Training Transformer model")
-    logger.info(f"Number of RAFT trainable parameters: {sum(p.numel() for p in raft_parameters)}")
+    # logger.info(f"Number of RAFT trainable parameters: {sum(p.numel() for p in raft_parameters)}")
     logger.info(f"Number of Transformer trainable parameters: {sum(p.numel() for p in transformer_parameters)}")
     logger.info(f"Total number of trainable parameters: {num_trainable_params}")
 
@@ -1041,12 +1041,12 @@ def main(args):
                 while len(weights) > 0:
                     weights.pop()
                     model = models[i]
-                    try:
-                        sub_dir = "transformer"
-                        model.save_pretrained(os.path.join(output_dir, sub_dir))
-                    except:
-                        model_name = 'raft'
-                        torch.save(model.state_dict(), os.path.join(output_dir, f"{model_name}_weights.pt"))
+                    
+                    sub_dir = "transformer"
+                    model.save_pretrained(os.path.join(output_dir, sub_dir))
+                    # except:
+                    #     model_name = 'raft'
+                    #     torch.save(model.state_dict(), os.path.join(output_dir, f"{model_name}_weights.pt"))
 
                     i -= 1
 
@@ -1099,8 +1099,8 @@ def main(args):
 
     # Optimizer creation
     # params_to_optimize = controlnet.parameters()
-    # params_to_optimize = transformer.parameters()
-    params_to_optimize = raft_parameters + transformer_parameters
+    params_to_optimize = transformer.parameters()
+    # params_to_optimize = raft_parameters + transformer_parameters
     # transformer_parameters_with_lr = {"params": transformer_lora_parameters, "lr": args.learning_rate}
     # params_to_optimize = [transformer_parameters_with_lr]
     optimizer = optimizer_class(
@@ -1135,7 +1135,7 @@ def main(args):
     train_dataset = VideoPairedCaptionDataset(root_folder=args.root_folders, 
                                          null_text_ratio=args.null_text_ratio,
                                          use_sea_raft = args.use_sea_raft,)
-    train_dataset = Subset(train_dataset, list(range(10000)))
+    # train_dataset = Subset(train_dataset, list(range(10000)))
     val_dataset = Subset(train_dataset, list(range(0, 3)))
     
     # val_dataset = VideoPairedCaptionDataset(root_folder=args.root_folders, 
@@ -1176,8 +1176,8 @@ def main(args):
     )
 
     # Prepare everything with our `accelerator`.
-    transformer, optimizer, train_dataloader, val_dataloader, lr_scheduler, raft, flow_extractor = accelerator.prepare(
-        transformer, optimizer, train_dataloader, val_dataloader, lr_scheduler, raft, flow_extractor
+    transformer, optimizer, train_dataloader, val_dataloader, lr_scheduler = accelerator.prepare(
+        transformer, optimizer, train_dataloader, val_dataloader, lr_scheduler
     )
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
@@ -1313,7 +1313,7 @@ def main(args):
                 pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(dtype=model_input.dtype)
                 # prompt_embeds = torch.cat([prompt_embeds, image_embedding], dim=-2)
                 
-                target_features.clear()
+                # target_features.clear()
                 # Predict the noise residual
                 model_pred = transformer(
                     hidden_states=noisy_model_input,
@@ -1323,107 +1323,20 @@ def main(args):
                     pooled_projections=pooled_prompt_embeds,
                     return_dict=False,
                 )[0]
-                # [query_feature, key_feature, control_q_feature, control_k_feature] * # of target layers
-                # Use [query_feature, key_feature] for optical flow prediction (0,1, 4,5,...)
                 
-                curr_frame_features = []
-                prev_frame_features = []
-                next_frame_features = []
-                
-                for i in range(0, len(target_features), 4):
-                    # Use Query features for curr_frame_features
-                    query_feautres = target_features[i]
-                    # Use Key features for prev_frame_features
-                    key_features = target_features[i+1]
-                    
-                    curr_frame_features.append(query_feautres.chunk(3, dim=1)[1]) # take the middle frame feature
-                    prev_frame_features.append(key_features.chunk(3, dim=1)[0]) # take the previous frame feature
-                    next_frame_features.append(key_features.chunk(3, dim=1)[2]) # take the next frame feature
-                
-                # forward/backward에 들어갈 feature list 구성 (is_qk_features=True 포맷)
-                forward_diff_features = [curr_frame_features, next_frame_features]
-                backward_diff_features = [curr_frame_features, prev_frame_features]
-
+                # Optical flow prediction
+                # diffusion_features = target_features
                 lr_image = batch["lq_image"].to(dtype=model_input.dtype)
-                lr_image_bf = rearrange(lr_image, '(b f) c h w -> b f c h w', f=3)
-                lr_image1 = lr_image_bf[:, 0]  # (B, C, H, W)
-                lr_image2 = lr_image_bf[:, 1]
-                lr_image3 = lr_image_bf[:, 2]
-                
-                gt_image = batch["gt_image"].to(dtype=model_input.dtype)
-                gt_image_bf = rearrange(gt_image, '(b f) c h w -> b f c h w', f=3)
-                gt_image1 = gt_image_bf[:, 0]  # (B, C, H, W)
-                gt_image2 = gt_image_bf[:, 1]
-                gt_image3 = gt_image_bf[:, 2]
-                
-                B = lr_image2.shape[0]
-
-                # ----------------------------
-                # 1) 이미지 pair를 batch로 합치기
-                #   forward: (lr2 -> lr3)
-                #   backward: (lr2 -> lr1)
-                # ----------------------------
-                img_a = torch.cat([lr_image2, lr_image2], dim=0)  # (2B, C, H, W)
-                img_b = torch.cat([lr_image3, lr_image1], dim=0)  # (2B, C, H, W)
-
-                gt_img_a = torch.cat([gt_image2, gt_image2], dim=0)  # (2B, C, H, W)
-                gt_img_b = torch.cat([gt_image3, gt_image1], dim=0)  # (2B, C, H, W)
-                # ----------------------------
-                # 2) features도 batch로 합치기
-                #   features_cat = [q_list_cat, k_list_cat]
-                #   q_list_cat[i] = cat(forward_q[i], backward_q[i], dim=0)
-                # ----------------------------
-                q_fwd_list = forward_diff_features[0]  # curr_frame_features
-                k_fwd_list = forward_diff_features[1]  # next_frame_features
-                q_bwd_list = backward_diff_features[0] # curr_frame_features
-                k_bwd_list = backward_diff_features[1] # prev_frame_features
-
-                # 안전 체크: list 길이 같아야 함
-                assert len(q_fwd_list) == len(q_bwd_list), "q feature list length mismatch"
-                assert len(k_fwd_list) == len(k_bwd_list), "k feature list length mismatch"
-                assert len(q_fwd_list) == len(k_fwd_list), "q/k feature list length mismatch"
-
-                q_cat = [torch.cat([qf, qb], dim=0) for qf, qb in zip(q_fwd_list, q_bwd_list)]
-                k_cat = [torch.cat([kf, kb], dim=0) for kf, kb in zip(k_fwd_list, k_bwd_list)]
-                features_cat = [q_cat, k_cat]
-
-                # ----------------------------
-                # 3) RAFT "한 번만" 호출
-                # ----------------------------
-                flow_preds_cat = raft(img_a, img_b, features_cat, iters=12, is_qk_features=True)
-
-                # flow_preds_cat: list length = iters, each tensor (2B, 2, H, W)
-                forward_flow_preds  = [p[:B] for p in flow_preds_cat]
-                backward_flow_preds = [p[B:] for p in flow_preds_cat]
-
-                # ----------------------------
-                # 4) GT도 가능하면 한 번에 (그리고 no_grad 추천)
-                # ----------------------------
-                with torch.no_grad():
-                    _, flow_gt_cat = flow_extractor(gt_img_a, gt_img_b, iters=20, test_mode=True)
-
-                forward_flow_gt  = flow_gt_cat[:B]
-                backward_flow_gt = flow_gt_cat[B:]
-
-                # ----------------------------
-                # 5) loss 계산은 기존 그대로
-                # ----------------------------
-                forward_flow_loss, forward_metrics = raft_tools.sequence_loss(
-                    forward_flow_preds,
-                    forward_flow_gt,
-                    torch.ones_like(forward_flow_gt[:, :1]),
-                    0.8,
-                )
-
-                backward_flow_loss, backward_metrics = raft_tools.sequence_loss(
-                    backward_flow_preds,
-                    backward_flow_gt,
-                    torch.ones_like(backward_flow_gt[:, :1]),
-                    0.8,
-                )
-
-                flow_loss = 0.5 * (forward_flow_loss + backward_flow_loss)
-                
+                lr_image1 = rearrange(lr_image, '(b f) c h w -> b f c h w', f=3)[:,0,:,:,:] # take the first frame
+                lr_image2 = rearrange(lr_image, '(b f) c h w -> b f c h w', f=3)[:,1,:,:,:] # take the second frame
+                # flow_preds = raft(lr_image1, lr_image2, diffusion_features, iters=12,)
+                # flow_gt = batch['gt_flow'].to(dtype=model_input.dtype)
+                # flow_loss, metrics = raft_tools.sequence_loss(
+                #     flow_preds,
+                #     flow_gt,
+                #     torch.ones_like(flow_gt[:, :1, :, :]),
+                #     0.8,
+                # )
                 # Follow: Section 5 of https://arxiv.org/abs/2206.00364.
                 # Preconditioning of the model outputs.
                 if args.precondition_outputs:
@@ -1447,13 +1360,18 @@ def main(args):
                 diff_loss = diff_loss.mean()
 
                 
-                loss = diff_loss + args.flow_loss_weight * flow_loss
-                
+                # if not args.only_train_raft:
+                #     # add flow loss to total loss
+                #     loss = diff_loss + args.flow_loss_weight * flow_loss
+                # else:
+                #     loss = flow_loss
+                loss = diff_loss
+                    
                 accelerator.backward(loss)
                 
                 if accelerator.sync_gradients:
                     # params_to_clip = controlnet.parameters()
-                    params_to_clip = transformer_parameters + raft_parameters
+                    params_to_clip = transformer_parameters
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                     
                 optimizer.step()
@@ -1468,25 +1386,9 @@ def main(args):
                     accelerator.log(
                         {
                             'train/total_loss': loss.detach().item(),
-                            'train/flow_loss': flow_loss.detach().item(),
-                            'train/diff_loss': diff_loss.detach().item(),
                             'train/lr': lr_scheduler.get_last_lr()[0],
                         }
                     )
-                    forward_log_dict = {
-                        'forward/epe': float(forward_metrics['epe']),
-                        'forward/1px': float(forward_metrics['1px']),
-                        'forward/3px': float(forward_metrics['3px']),
-                        'forward/5px': float(forward_metrics['5px']),
-                    }
-                    accelerator.log(forward_log_dict, step=global_step)
-                    backward_log_dict = {
-                        'backward/epe': float(backward_metrics['epe']),
-                        'backward/1px': float(backward_metrics['1px']),
-                        'backward/3px': float(backward_metrics['3px']),
-                        'backward/5px': float(backward_metrics['5px']),
-                    }
-                    accelerator.log(backward_log_dict, step=global_step)
                     # if args.only_train_raft:
                     #     accelerator.log(
                     #         {
@@ -1530,17 +1432,18 @@ def main(args):
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
-                # continue
+                continue
                 if global_step % args.validation_steps == 0 or global_step == 1:
                     
                     # Logging Training Flow Visualization
-                    # flow_lq = batch['lq_flow']
+                    flow_lq = batch['lq_flow']
                     
-                    forward_pil_images = viz(batch['gt_image'],
+                    pil_images = viz(batch['gt_image'],
                                         batch['lq_image'],
-                                        forward_flow_preds[-1],
-                                        forward_flow_gt,)
-                    for idx, pil_image in enumerate(forward_pil_images):
+                                        flow_preds[-1],
+                                        batch['gt_flow'],
+                                        flow_lq=flow_lq,)
+                    for idx, pil_image in enumerate(pil_images):
                         video_id = batch['video_id'][idx]
                         frame_idx = batch['frame_idx'][idx]
                         caption = f'{video_id}_frame{frame_idx-1:02d}'
@@ -1548,54 +1451,41 @@ def main(args):
                         tag = '_null_prompt' if null_flag else ''
                         caption += tag
                         accelerator.log(
-                            {f'forward/forward_flow_viz_{idx}': wandb.Image(pil_image, caption=caption)}, step=global_step
+                            {f'train/flow_viz_{idx}': wandb.Image(pil_image, caption=caption)}, step=global_step
                         )
-                    backward_pil_images = viz(batch['gt_image'],
-                                        batch['lq_image'],
-                                        backward_flow_preds[-1],
-                                        backward_flow_gt,)
-                    for idx, pil_image in enumerate(backward_pil_images):
-                        video_id = batch['video_id'][idx]
-                        frame_idx = batch['frame_idx'][idx]
-                        caption = f'{video_id}_frame{frame_idx-1:02d}'
-                        null_flag = batch['is_null'][idx]
-                        tag = '_null_prompt' if null_flag else ''
-                        caption += tag
-                        accelerator.log(
-                            {f'backward/backward_flow_viz_{idx}': wandb.Image(pil_image, caption=caption)}, step=global_step
-                        )
+
                     # Decode sample images for logging
-                    # if not args.only_train_raft:
-                    #     model_pred_image = decode_image(vae, model_pred.detach())
-                    #     model_pred_image = rearrange(model_pred_image, '(b f) c h w -> b f c h w', f=3)
+                    if not args.only_train_raft:
+                        model_pred_image = decode_image(vae, model_pred.detach())
+                        model_pred_image = rearrange(model_pred_image, '(b f) c h w -> b f c h w', f=3)
                         
-                    #     gt_image = rearrange(batch['gt_image'], '(b f) c h w -> b f c h w', f=3)
-                    #     lq_image = rearrange(batch['lq_image'], '(b f) c h w -> b f c h w', f=3)
+                        gt_image = rearrange(batch['gt_image'], '(b f) c h w -> b f c h w', f=3)
+                        lq_image = rearrange(batch['lq_image'], '(b f) c h w -> b f c h w', f=3)
                         
-                    #     timesteps = rearrange(timesteps, '(b f) -> b f', f=3)[:,0]
-                    #     img_logs = pred_img_grid(lq_image, gt_image, model_pred_image)
+                        timesteps = rearrange(timesteps, '(b f) -> b f', f=3)[:,0]
+                        img_logs = pred_img_grid(lq_image, gt_image, model_pred_image)
                         
-                    #     for idx, img_log in enumerate(img_logs):
-                    #         video_id = batch['video_id'][idx]
-                    #         frame_idx = batch['frame_idx'][idx]
-                    #         timestep = timesteps[idx].item()
-                    #         caption = f'{video_id}_frame{frame_idx-1:02d}_step{timestep}'
-                    #         null_flag = batch['is_null'][idx]
-                    #         tag = '_null_prompt' if null_flag else ''
-                    #         caption += tag
-                    #         accelerator.log(
-                    #             {f'train/pred_img_{idx}': wandb.Image(img_log, caption=caption)}, step=global_step
-                    #         )
+                        for idx, img_log in enumerate(img_logs):
+                            video_id = batch['video_id'][idx]
+                            frame_idx = batch['frame_idx'][idx]
+                            timestep = timesteps[idx].item()
+                            caption = f'{video_id}_frame{frame_idx-1:02d}_step{timestep}'
+                            null_flag = batch['is_null'][idx]
+                            tag = '_null_prompt' if null_flag else ''
+                            caption += tag
+                            accelerator.log(
+                                {f'train/pred_img_{idx}': wandb.Image(img_log, caption=caption)}, step=global_step
+                            )
                     
-                    # # Validation step
-                    #     logs = validation_loop(args, accelerator, transformer, raft, val_dataloader, weight_dtype,
-                    #                         noise_scheduler_copy, get_sigmas, target_features, vae)
-                    # else:
-                    #     logs = validation_loop(args, accelerator, transformer, raft, val_dataloader, weight_dtype,
-                    #                         noise_scheduler_copy, get_sigmas, target_features, None)
+                    # Validation step
+                        logs = validation_loop(args, accelerator, transformer, raft, val_dataloader, weight_dtype,
+                                            noise_scheduler_copy, get_sigmas, target_features, vae)
+                    else:
+                        logs = validation_loop(args, accelerator, transformer, raft, val_dataloader, weight_dtype,
+                                            noise_scheduler_copy, get_sigmas, target_features, None)
                         
-                    # if accelerator.is_main_process:
-                    #     accelerator.log(logs, step=global_step)
+                    if accelerator.is_main_process:
+                        accelerator.log(logs, step=global_step)
 
             # logs = {"loss": loss.detach().d(), "lr": lr_scheduler.get_last_lr()[0]}
             # progress_bar.set_postfix(**logs)

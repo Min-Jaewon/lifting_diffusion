@@ -40,7 +40,7 @@ from diffusers import (
     StableDiffusion3ControlNetPipeline,
     StableDiffusion3Pipeline,
 )
-from model_dit4sr.transformer_sd3 import SD3Transformer2DModel
+from model_dit4sr.transformer_sd3_ours import SD3Transformer2DModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3, free_memory, cast_training_params
 from diffusers.utils import check_min_version, is_wandb_available
@@ -925,7 +925,21 @@ def main(args):
             args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
         )
     transformer.requires_grad_(False)
+    for i in range(13, 24):
+        block = transformer.transformer_blocks[i]
+        # attn2 or norm1
+        module = None
+        if hasattr(block, 'attn2'):
+            module = block.attn2
     
+        if module is not None:
+            for name, param in module.named_parameters():
+                param.zero_()
+                param.requires_grad = True
+            print(f'transformer block {i} attn2set to trainable with zero initialization.')
+        else:
+            raise ValueError(f'transformer block {i} has no attn2 module.')
+
     # Load VAE
     if not args.only_train_raft:
         vae = AutoencoderKL.from_pretrained(
@@ -999,9 +1013,9 @@ def main(args):
     # Set which modules to train
     # if not args.only_train_raft:
         # release the cross-attention part in the unet.
-    if args.target_lifting_layer is not None:
-        for layer in args.target_lifting_layer:
-            args.trainable_modules.append(f'transformer_blocks.{layer}.attn')
+    # if args.target_lifting_layer is not None:
+    #     for layer in args.target_lifting_layer:
+    #         args.trainable_modules.append(f'transformer_blocks.{layer}.attn2')
     transformer.target_lifting_layer = args.target_lifting_layer
     for name, params in transformer.named_parameters():
         # print(name)
@@ -1325,7 +1339,6 @@ def main(args):
                 )[0]
                 # [query_feature, key_feature, control_q_feature, control_k_feature] * # of target layers
                 # Use [query_feature, key_feature] for optical flow prediction (0,1, 4,5,...)
-                
                 curr_frame_features = []
                 prev_frame_features = []
                 next_frame_features = []
