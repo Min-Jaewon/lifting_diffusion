@@ -11,7 +11,7 @@ results
 */__pycache__/*
 checkpoints
 weights
-*.ckpt
+# *.ckpt
 *.pth
 *.ppm
 *.flo
